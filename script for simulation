@@ -1,16 +1,20 @@
 """
 Section 6: Agent-Based Numerical Simulation of Endogenous Crisis Formation
-Stable Colab Version
+Stable Colab Version with Reserve Migration Ratio Ω_t
 
 Three agent classes:
 1. Liquidity Providers
 2. Leveraged Speculators
 3. Crisis-Sensitive Reallocators
 
-Outputs:
+Core outputs:
 - ABM time series CSV
 - Summary statistics CSV
-- 7 manuscript-ready figures
+- 8 manuscript-ready figures
+
+Major upgrade:
+- Figure 8: Reserve Migration Ratio Ω_t
+  This figure captures monetary-hierarchy compression and reserve migration.
 """
 
 import os
@@ -30,7 +34,7 @@ class ABMConfig:
     n_steps = 30000
     dt_minutes = 1
 
-    output_dir = "output_abm_stable"
+    output_dir = "output_abm_stable_with_omega"
 
     initial_price = 1500.0
     initial_fundamental = 1500.0
@@ -83,6 +87,10 @@ class ABMConfig:
     metric_window = 500
     entropy_bins = 35
     hill_tail_fraction = 0.08
+
+    # Reserve migration metric
+    omega_smoothing_window = 100
+    omega_epsilon = 1e-6
 
 
 CFG = ABMConfig()
@@ -211,12 +219,14 @@ def run_abm(cfg):
     forced_flow = np.zeros(cfg.n_steps)
     lp_activity = np.zeros(cfg.n_steps)
 
+    reserve_allocation = np.zeros(cfg.n_steps)
+    speculative_allocation = np.zeros(cfg.n_steps)
+
     spread[0] = cfg.base_spread
     depth[0] = cfg.base_depth
     stress[0] = 0.03
     lp_activity[0] = 1.0
 
-    # Agent states
     lp_inventory = rng.normal(0, 4, cfg.n_lp)
 
     spec_positions = rng.normal(0, 1, cfg.n_spec)
@@ -243,10 +253,6 @@ def run_abm(cfg):
     )
 
     for t in range(1, cfg.n_steps):
-
-        # ----------------------------
-        # Fundamental value
-        # ----------------------------
         log_fundamental[t] = (
             log_fundamental[t - 1]
             + rng.normal(0.0, cfg.fundamental_sigma)
@@ -254,9 +260,6 @@ def run_abm(cfg):
 
         mispricing = log_price[t - 1] - log_fundamental[t]
 
-        # ----------------------------
-        # Local volatility and trend
-        # ----------------------------
         if t >= 30:
             recent = returns[t - 30:t]
             short_vol = np.std(recent)
@@ -267,13 +270,9 @@ def run_abm(cfg):
 
         prev_stress = stress[t - 1]
 
-        # ----------------------------
-        # Liquidity providers
-        # ----------------------------
         active_prob = 1.0 - sigmoid(
             cfg.lp_withdraw_slope * (prev_stress - 0.55)
         )
-
         active_prob = np.clip(active_prob, 0.05, 1.0)
 
         lp_orders = (
@@ -281,7 +280,6 @@ def run_abm(cfg):
             -0.08 * lp_inventory
             + rng.normal(0, 1.5, cfg.n_lp)
         )
-
         lp_orders *= active_prob
 
         lp_net = lp_orders.sum()
@@ -293,9 +291,6 @@ def run_abm(cfg):
             cfg.lp_inventory_limit
         )
 
-        # ----------------------------
-        # Leveraged speculators
-        # ----------------------------
         spec_noise = rng.normal(0, cfg.spec_noise_weight, cfg.n_spec)
 
         spec_trend_orders = (
@@ -310,7 +305,6 @@ def run_abm(cfg):
         margin_prob = sigmoid(
             14.0 * (prev_stress - cfg.margin_stress_threshold)
         )
-
         margin_flags = rng.uniform(size=cfg.n_spec) < margin_prob
 
         deleveraging = np.zeros(cfg.n_spec)
@@ -327,9 +321,6 @@ def run_abm(cfg):
         spec_net = spec_orders.sum()
         forced_net = deleveraging.sum()
 
-        # ----------------------------
-        # Crisis-sensitive reallocators
-        # ----------------------------
         csr_activation = sigmoid(
             cfg.csr_slope * (prev_stress - csr_thresholds)
         )
@@ -343,9 +334,6 @@ def run_abm(cfg):
 
         csr_net = csr_orders.sum()
 
-        # ----------------------------
-        # Aggregate flow
-        # ----------------------------
         total_order = lp_net + spec_net + csr_net
 
         gross_flow = (
@@ -357,21 +345,14 @@ def run_abm(cfg):
 
         imb = total_order / gross_flow
 
-        # ----------------------------
-        # Endogenous depth
-        # ----------------------------
         depth_t = (
             cfg.base_depth
             * (1.0 - 0.55 * min(prev_stress, 1.0))
             * np.exp(-6.0 * short_vol)
             * (0.65 + 0.35 * active_prob)
         )
-
         depth_t = np.clip(depth_t, cfg.min_depth, cfg.base_depth)
 
-        # ----------------------------
-        # Endogenous spread
-        # ----------------------------
         inv_pressure = np.mean(np.abs(lp_inventory)) / cfg.lp_inventory_limit
 
         spread_t = (
@@ -380,12 +361,8 @@ def run_abm(cfg):
             + cfg.lp_inventory_spread_weight * inv_pressure
             + 0.0015 * (1.0 - active_prob)
         )
-
         spread_t = np.clip(spread_t, cfg.base_spread, 0.025)
 
-        # ----------------------------
-        # Price impact
-        # ----------------------------
         impact = cfg.impact_scale * total_order / depth_t
         reversion = -cfg.mean_reversion * mispricing
         noise = rng.normal(0, 0.00008 + 0.15 * short_vol)
@@ -397,16 +374,11 @@ def run_abm(cfg):
             jump = rng.normal(0, 0.0025 + 1.5 * short_vol)
 
         r_t = reversion + impact + noise + jump
-
-        # numerical safety
         r_t = np.clip(r_t, -cfg.max_abs_return, cfg.max_abs_return)
 
         returns[t] = r_t
         log_price[t] = log_price[t - 1] + r_t
 
-        # ----------------------------
-        # Stress update
-        # ----------------------------
         stress_innovation = (
             cfg.stress_return_weight * abs(r_t)
             + cfg.stress_spread_weight * spread_t
@@ -419,6 +391,18 @@ def run_abm(cfg):
             + (1.0 - cfg.stress_decay) * stress_innovation,
             0.0,
             1.0
+        )
+
+        reserve_allocation[t] = (
+            abs(csr_net)
+            + 0.50 * max(lp_net, 0.0)
+            + 0.10 * depth_t / cfg.base_depth
+        )
+
+        speculative_allocation[t] = (
+            abs(spec_net)
+            + abs(forced_net)
+            + 0.10 * abs(imb)
         )
 
         spread[t] = spread_t
@@ -446,6 +430,8 @@ def run_abm(cfg):
             "csr_flow": csr_flow,
             "forced_deleveraging_flow": forced_flow,
             "lp_activity": lp_activity,
+            "reserve_allocation": reserve_allocation,
+            "speculative_allocation": speculative_allocation,
         },
         index=time_index
     )
@@ -454,7 +440,7 @@ def run_abm(cfg):
 
 
 # ============================================================
-# 3. ROLLING ENTROPY, TAIL, LIQUIDITY, GAMMA
+# 3. ROLLING ENTROPY, TAIL, LIQUIDITY, GAMMA, OMEGA
 # ============================================================
 
 def compute_metrics(df, cfg):
@@ -503,17 +489,24 @@ def compute_metrics(df, cfg):
 
     out["L_t_raw"] = L_components.mean(axis=1)
 
-    # Positive liquidity stress
     out["L_t"] = out["L_t_raw"] - out["L_t_raw"].min(skipna=True) + 1e-6
-
-    # Effective market depth proxy
     out["Lambda_t"] = 1.0 / (1.0 + out["L_t"])
 
-    # Entropy-tail instability metric
     out["Gamma_t"] = (
         out["H_tsallis"]
         * out["xi_hill"]
         * (1.0 + out["L_t"])
+    )
+
+    out["Omega_t_raw"] = (
+        out["reserve_allocation"]
+        / (out["speculative_allocation"] + cfg.omega_epsilon)
+    )
+
+    out["Omega_t"] = (
+        out["Omega_t_raw"]
+        .rolling(cfg.omega_smoothing_window)
+        .mean()
     )
 
     return out
@@ -524,7 +517,7 @@ def compute_metrics(df, cfg):
 # ============================================================
 
 def build_summary(df, cfg):
-    valid = df.dropna(subset=["H_tsallis", "xi_hill", "Gamma_t"])
+    valid = df.dropna(subset=["H_tsallis", "xi_hill", "Gamma_t", "Omega_t"])
 
     calm = valid[valid["stress"] <= valid["stress"].quantile(0.30)]
     crisis = valid[valid["stress"] >= valid["stress"].quantile(0.80)]
@@ -546,11 +539,12 @@ def build_summary(df, cfg):
                 "Mean Hill Xi": d["xi_hill"].mean(),
                 "Mean Gamma": d["Gamma_t"].mean(),
                 "Max Gamma": d["Gamma_t"].max(),
+                "Mean Omega": d["Omega_t"].mean(),
+                "Max Omega": d["Omega_t"].max(),
             }
         )
 
-    summary = pd.DataFrame(rows)
-    return summary
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -564,17 +558,17 @@ def crisis_time(df):
     return df.index[int(len(df) * 0.65)]
 
 
-def savefig(path):
+def savefig(path, show=True):
     plt.tight_layout()
     plt.savefig(path, dpi=300)
-    plt.show()
+    if show:
+        plt.show()
     plt.close()
 
 
 def make_figures(df, cfg):
     ctime = crisis_time(df)
 
-    # Figure 1
     plt.figure(figsize=(12, 5))
     plt.plot(df.index, df["price"], label="Market Price", linewidth=1.2)
     plt.plot(df.index, df["fundamental"], label="Fundamental", linewidth=1.0)
@@ -584,17 +578,15 @@ def make_figures(df, cfg):
     plt.legend()
     savefig(os.path.join(cfg.output_dir, "Fig1_ABM_Price.png"))
 
-    # Figure 2
     plt.figure(figsize=(12, 5))
     plt.plot(df.index, df["H_tsallis"], label="Tsallis Entropy", linewidth=1.2)
     plt.plot(df.index, df["H_shannon"], label="Shannon Entropy", linewidth=1.0)
     plt.axvline(ctime, linestyle="--", label="Crisis Threshold")
-    plt.title("Figure 2: Entropy Escalation")
+    plt.title("Figure 2: Entropy Deformation")
     plt.ylabel("Entropy")
     plt.legend()
     savefig(os.path.join(cfg.output_dir, "Fig2_ABM_Entropy.png"))
 
-    # Figure 3
     plt.figure(figsize=(12, 5))
     plt.plot(df.index, df["xi_hill"], linewidth=1.2)
     plt.axvline(ctime, linestyle="--", label="Crisis Threshold")
@@ -603,7 +595,6 @@ def make_figures(df, cfg):
     plt.legend()
     savefig(os.path.join(cfg.output_dir, "Fig3_ABM_TailRisk.png"))
 
-    # Figure 4
     plt.figure(figsize=(12, 5))
     plt.plot(df.index, df["L_t"], label="Liquidity Stress $L_t$", linewidth=1.2)
     plt.plot(df.index, df["spread"] * 10000, label="Spread, bp", linewidth=1.0)
@@ -613,7 +604,6 @@ def make_figures(df, cfg):
     plt.legend()
     savefig(os.path.join(cfg.output_dir, "Fig4_ABM_Liquidity.png"))
 
-    # Figure 5
     plt.figure(figsize=(12, 5))
     plt.plot(df.index, df["Gamma_t"], linewidth=1.3)
     plt.axvline(ctime, linestyle="--", label="Crisis Threshold")
@@ -622,11 +612,9 @@ def make_figures(df, cfg):
     plt.legend()
     savefig(os.path.join(cfg.output_dir, "Fig5_ABM_Gamma.png"))
 
-    # Figure 6
     valid = df[["H_tsallis", "xi_hill", "spread", "stress"]].dropna()
 
     plt.figure(figsize=(8.5, 6.5))
-
     calm = valid["stress"] <= valid["stress"].quantile(0.40)
     crisis = valid["stress"] >= valid["stress"].quantile(0.80)
 
@@ -655,7 +643,6 @@ def make_figures(df, cfg):
     plt.legend()
     savefig(os.path.join(cfg.output_dir, "Fig6_ABM_PhaseSpace.png"))
 
-    # Figure 7
     plt.figure(figsize=(12, 5))
     plt.plot(df.index, df["lp_flow"], label="Liquidity Providers", linewidth=0.8)
     plt.plot(df.index, df["spec_flow"], label="Leveraged Speculators", linewidth=0.8)
@@ -667,17 +654,44 @@ def make_figures(df, cfg):
     plt.legend(ncol=2)
     savefig(os.path.join(cfg.output_dir, "Fig7_ABM_AgentFlows.png"))
 
+    plt.figure(figsize=(12, 5))
+    plt.plot(
+        df.index,
+        df["Omega_t"],
+        linewidth=1.5,
+        label=r"Reserve Migration Ratio $\Omega_t$"
+    )
+    plt.axvline(ctime, linestyle="--", label="Crisis Threshold")
+    plt.title(r"Figure 8: Reserve Migration Ratio and Monetary-Hierarchy Compression")
+    plt.ylabel(r"$\Omega_t$")
+    plt.legend()
+    savefig(os.path.join(cfg.output_dir, "Fig8_Reserve_Migration_Ratio_Omega.png"))
+
+    combo = df[["Omega_t", "Gamma_t"]].dropna()
+    if not combo.empty:
+        omega_z = zscore_series(combo["Omega_t"])
+        gamma_z = zscore_series(combo["Gamma_t"])
+
+        plt.figure(figsize=(12, 5))
+        plt.plot(combo.index, omega_z, label=r"Standardized $\Omega_t$", linewidth=1.2)
+        plt.plot(combo.index, gamma_z, label=r"Standardized $\Gamma_t$", linewidth=1.2)
+        plt.axvline(ctime, linestyle="--", label="Crisis Threshold")
+        plt.title(r"Diagnostic: Reserve Migration and Entropy–Tail Instability")
+        plt.ylabel("Standardized Value")
+        plt.legend()
+        savefig(os.path.join(cfg.output_dir, "Fig9_Diagnostic_Omega_Gamma.png"))
+
 
 # ============================================================
 # 6. MAIN
 # ============================================================
 
 def main():
-    print("Running stable three-class ABM...")
+    print("Running stable three-class ABM with Reserve Migration Ratio Ω_t...")
 
     df = run_abm(CFG)
 
-    print("Computing rolling entropy, tail-risk, liquidity stress, and Gamma...")
+    print("Computing rolling entropy, tail-risk, liquidity stress, Gamma, and Omega...")
 
     df = compute_metrics(df, CFG)
 
@@ -687,8 +701,8 @@ def main():
 
     print(summary)
 
-    df.to_csv(os.path.join(CFG.output_dir, "abm_timeseries_stable.csv"))
-    summary.to_csv(os.path.join(CFG.output_dir, "abm_summary_stable.csv"), index=False)
+    df.to_csv(os.path.join(CFG.output_dir, "abm_timeseries_stable_with_omega.csv"))
+    summary.to_csv(os.path.join(CFG.output_dir, "abm_summary_stable_with_omega.csv"), index=False)
 
     print("Generating figures...")
 
